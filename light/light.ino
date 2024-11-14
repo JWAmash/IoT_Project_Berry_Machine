@@ -1,383 +1,160 @@
-#include <WiFi.h>
-#include <PubSubClient.h>
-#include <Servo.h>
-#include <ArduinoJson.h>
+#include <WiFi.h>          // UNO R4 WiFi용 Wi-Fi 라이브러리
+#include <PubSubClient.h>    // MQTT 통신을 위한 라이브러리
 
-// WiFi 설정
-const char* ssid = "KT_GiGA_0BF0";          // Wi-Fi SSID
-const char* password = "bke72cg443";  // Wi-Fi 비밀번호
+// Wi-Fi 및 MQTT 브로커 설정
+const char* ssid = "KT_GiGA_0BF0";               // Wi-Fi SSID
+const char* password = "bke72cg443";             // Wi-Fi 비밀번호
+const char* mqtt_server = "test.mosquitto.org";  // MQTT 브로커 주소
+const int mqtt_port = 1883;                      // MQTT 포트 번호 (일반적으로 1883)
 
-// MQTT 브로커 설정
-const char* mqttServer = "test.mosquitto.org";
-const int mqttPort = 1883;
-const char* mqttClientID = "berryblind";
-const char* controlTopic = "blinds/control";
-const char* settingsTopic = "blinds/settings";
+// MQTT 토픽 설정
+const char* mqtt_topic_status = "light/status";    // 조명 상태 토픽
+const char* mqtt_topic_control = "light/control";  // 조명 제어 토픽
 
-// WiFi 및 MQTT 클라이언트 객체 생성
+// 하드웨어 핀 설정
+const int soundSensor = 2;  // 사운드 센서 핀 (인터럽트 지원 핀)
+const int relayPin = 7;     // 릴레이 제어 핀
+
+// 변수 선언
+volatile bool clapDetected = false;   // 박수 감지 플래그 (인터럽트에서 사용)
+bool lightState = false;              // 조명 상태 (켜짐/꺼짐)
+int clapCount = 0;                    // 박수 횟수
+unsigned long lastClapTime = 0;       // 마지막 박수 시간
+const unsigned long clapInterval = 1000; // 박수 간 최대 간격 (밀리초)
+
+// Wi-Fi 및 MQTT 클라이언트 객체 생성
 WiFiClient espClient;
 PubSubClient client(espClient);
 
-// 서보 모터 설정
-Servo continuousServo;
-const int servoPin = 9;  // 서보 모터 핀 번호
-
-// 핀 설정
-const int trigPin = 10;   // 초음파 센서 Trig 핀
-const int echoPin = 11;   // 초음파 센서 Echo 핀
-const int ldrPin = A0;    // 조도 센서 핀
-
-// 변수 및 임계값 설정
-int lightThresholdDark = 800;  // 어두울 때의 조도 임계값
-int lightThresholdBright = 500;  // 밝을 때의 조도 임계값
-bool autoMode = false;  // 자동 모드 플래그
-
-float minDistance = 5.0;   // 최소 거리 (센티미터)
-float maxDistance = 40.0;  // 최대 거리 (센티미터)
-
-// 모터 상태 변수
-enum MotorState { STOPPED, MOVING_UP, MOVING_DOWN };
-MotorState motorState = STOPPED;
-
-// 거리 측정값 저장을 위한 배열 및 변수
-const int numReadings = 5;
-float distanceReadings[numReadings];
-int readIndex = 0;
-float totalDistance = 0;
-float averageDistance = 0;
-
-void setup() {
-  Serial.begin(115200);
-
-  // WiFi 연결
-  setup_wifi();
-
-  // MQTT 설정
-  client.setServer(mqttServer, mqttPort);
-  client.setCallback(mqttCallback);
-
-  // 서보 모터 및 핀 설정
-  continuousServo.attach(servoPin);
-  pinMode(trigPin, OUTPUT);
-  pinMode(echoPin, INPUT);
-
-  stopMotor();
-
-  // 거리 측정값 배열 초기화
-  for (int i = 0; i < numReadings; i++) {
-    distanceReadings[i] = 0;
-  }
-
-  Serial.println("시리얼 명령어: 'U' - 올리기, 'D' - 내리기, 'S' - 정지, 'AF' - 자동모드 켜기, 'AN' - 자동모드 끄기");
+// 박수 감지 인터럽트 핸들러
+void detectClap() {
+  clapDetected = true;
 }
 
-void loop() {
-  if (!client.connected()) {
-    reconnect();
-  }
-  client.loop();
-
-  // 자동 모드에서만 handleAutoMode 실행
-  if (autoMode) {
-    handleAutoMode();
-  }
-
-  updateMotor();
-
-  // 시리얼 모니터 명령어 처리
-  processSerialCommand();
-}
-
-// WiFi 연결 함수
+// Wi-Fi 연결 함수
 void setup_wifi() {
   delay(10);
-  Serial.print("Connecting to ");
-  Serial.println(ssid);
-
+  Serial.println("Connecting to Wi-Fi...");
   WiFi.begin(ssid, password);
-
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 30) {
+  while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
-    retries++;
+  }
+  Serial.println("\nWi-Fi connected!");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// MQTT 콜백 함수
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi 연결 성공");
-    Serial.print("IP 주소: ");
-    Serial.println(WiFi.localIP());
+  message.trim(); // 메시지의 앞뒤 공백 제거
+
+  Serial.print("Message arrived [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(message);
+  
+  Serial.print("Topic as String: ");
+  Serial.println(String(topic));
+  Serial.print("mqtt_topic_control: ");
+  Serial.println(mqtt_topic_control);
+
+  // 문자열 비교 시 equals() 사용
+  if (String(topic).equals(mqtt_topic_control)) {
+    if (message.equals("ON")) {
+      lightState = true;
+      digitalWrite(relayPin, HIGH);
+      bool publishResult = client.publish(mqtt_topic_status, "ON");
+      Serial.println("Light turned ON by MQTT");
+      Serial.print("Publish result: ");
+      Serial.println(publishResult ? "Success" : "Failure");
+    } else if (message.equals("OFF")) {
+      lightState = false;
+      digitalWrite(relayPin, LOW);
+      bool publishResult = client.publish(mqtt_topic_status, "OFF");
+      Serial.println("Light turned OFF by MQTT");
+      Serial.print("Publish result: ");
+      Serial.println(publishResult ? "Success" : "Failure");
+    } else {
+      Serial.println("Unknown command received");
+    }
   } else {
-    Serial.println("\nWiFi 연결 실패");
+    Serial.print("Message received on unknown topic: ");
+    Serial.println(topic);
   }
 }
 
 // MQTT 재연결 함수
 void reconnect() {
   while (!client.connected()) {
-    Serial.print("MQTT 연결 시도...");
-    if (client.connect(mqttClientID)) {
-      Serial.println("연결됨");
-      client.subscribe(controlTopic);
-      client.subscribe(settingsTopic);
+    Serial.print("Attempting MQTT connection...");
+    // 클라이언트 ID를 고유하게 설정어제
+
+    if (client.connect("ArduinoClient123")) {
+      Serial.println("connected");
+      bool subscribeResult = client.subscribe(mqtt_topic_control);
+      Serial.print("Subscribe result: ");
+      Serial.println(subscribeResult ? "Success" : "Failure");
+      bool publishResult = client.publish(mqtt_topic_status, lightState ? "ON" : "OFF");
+      Serial.print("Initial status publish result: ");
+      Serial.println(publishResult ? "Success" : "Failure");
     } else {
-      Serial.print("실패, rc=");
+      Serial.print("failed, rc=");
       Serial.print(client.state());
-      Serial.println(" 5초 후 재시도");
+      Serial.println(" try again in 5 seconds");
       delay(5000);
     }
   }
 }
 
-// 시리얼 명령어 처리 함수
-void processSerialCommand() {
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
+// 설정 함수
+void setup() {
+  Serial.begin(115200);
+  pinMode(soundSensor, INPUT_PULLUP);  // 사운드 센서 핀 설정 (풀업 저항 사용)
+  pinMode(relayPin, OUTPUT);           // 릴레이 핀 출력 설정
+  digitalWrite(relayPin, LOW);         // 초기 조명 상태: 꺼짐
 
-    if (command == "U") {
-      moveBlindUp();
-    } else if (command == "D") {
-      moveBlindDown();
-    } else if (command == "S") {
-      stopMotor();
-    } else if (command == "AF") {
-      autoMode = true;
-      Serial.println("자동 모드 활성화");
-    } else if (command == "AN") {
-      autoMode = false;
-      stopMotor();
-      Serial.println("자동 모드 비활성화");
+  setup_wifi();                        // Wi-Fi 연결
+  client.setServer(mqtt_server, mqtt_port);  // MQTT 서버 및 포트 설정
+  client.setCallback(callback);        // MQTT 콜백 함수 설정
+
+  attachInterrupt(digitalPinToInterrupt(soundSensor), detectClap, RISING);  // 박수 감지 인터럽트 설정
+}
+
+// 메인 루프 함수
+void loop() {
+  if (!client.connected()) {
+    reconnect();  // MQTT 연결이 끊어졌다면 재연결
+  }
+  client.loop();  // MQTT 클라이언트 루프 실행
+
+  if (clapDetected) {
+    clapDetected = false;  // 플래그 초기화
+
+    unsigned long currentMillis = millis();
+    if (currentMillis - lastClapTime <= clapInterval) {
+      clapCount++;
     } else {
-      Serial.println("잘못된 명령어입니다.");
+      clapCount = 1;
+    }
+    lastClapTime = currentMillis;
+
+    Serial.print("Clap detected! Clap count: ");
+    Serial.println(clapCount);
+
+    if (clapCount == 3) {
+      lightState = !lightState;
+      digitalWrite(relayPin, lightState ? HIGH : LOW);
+      bool publishResult = client.publish(mqtt_topic_status, lightState ? "ON" : "OFF");
+      Serial.print("Light state changed by clap: ");
+      Serial.println(lightState ? "ON" : "OFF");
+      Serial.print("Publish result: ");
+      Serial.println(publishResult ? "Success" : "Failure");
+      clapCount = 0;
     }
   }
-}
-
-// MQTT 메시지 콜백 함수
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String messageTemp;
-
-  for (unsigned int i = 0; i < length; i++) {
-    messageTemp += (char)payload[i];
-  }
-
-  Serial.print("메시지 수신 [");
-  Serial.print(topic);
-  Serial.print("]: ");
-  Serial.println(messageTemp);
-
-  if (String(topic) == controlTopic) {
-    handleControlMessage(messageTemp);
-  } else if (String(topic) == settingsTopic) {
-    handleSettingsMessage(messageTemp);
-  }
-}
-
-// 제어 메시지 처리 함수
-void handleControlMessage(String cmd) {
-  if (cmd == "UP_PRESS") {
-    moveBlindUp();
-  } else if (cmd == "UP_RELEASE") {
-    stopMotor();
-  } else if (cmd == "DOWN_PRESS") {
-    moveBlindDown();
-  } else if (cmd == "DOWN_RELEASE") {
-    stopMotor();
-  } else if (cmd == "FULL_UP") {
-    moveBlindToPosition(maxDistance);
-  } else if (cmd == "FULL_DOWN") {
-    moveBlindToPosition(minDistance);
-  } else if (cmd == "STOP") {
-    stopMotor();
-  } else if (cmd == "AUTO_ON") {
-    autoMode = true;
-  } else if (cmd == "AUTO_OFF") {
-    autoMode = false;
-    stopMotor();
-  } else {
-    Serial.println("알 수 없는 명령어입니다.");
-  }
-}
-
-// 설정 메시지 처리 함수
-void handleSettingsMessage(String json) {
-  StaticJsonDocument<200> doc;
-  DeserializationError error = deserializeJson(doc, json);
-
-  if (error) {
-    Serial.print("deserializeJson() 실패: ");
-    Serial.println(error.f_str());
-    return;
-  }
-
-  if (doc.containsKey("maxDistance")) {
-    maxDistance = doc["maxDistance"];
-    Serial.print("maxDistance 업데이트: ");
-    Serial.println(maxDistance);
-  }
-  if (doc.containsKey("minDistance")) {
-    minDistance = doc["minDistance"];
-    Serial.print("minDistance 업데이트: ");
-    Serial.println(minDistance);
-  }
-  if (doc.containsKey("lightThresholdDark")) {
-    lightThresholdDark = doc["lightThresholdDark"];
-    Serial.print("lightThresholdDark 업데이트: ");
-    Serial.println(lightThresholdDark);
-  }
-  if (doc.containsKey("lightThresholdBright")) {
-    lightThresholdBright = doc["lightThresholdBright"];
-    Serial.print("lightThresholdBright 업데이트: ");
-    Serial.println(lightThresholdBright);
-  }
-}
-
-// 평균 거리 계산 함수
-float getAverageDistance() {
-  float newDistance = getDistance();
-  if (newDistance == -1.0) {
-    return averageDistance;
-  }
-
-  totalDistance = totalDistance - distanceReadings[readIndex];
-  distanceReadings[readIndex] = newDistance;
-  totalDistance = totalDistance + distanceReadings[readIndex];
-
-  readIndex = (readIndex + 1) % numReadings;
-
-  averageDistance = totalDistance / numReadings;
-  return averageDistance;
-}
-
-// 초음파 센서 거리 측정 함수
-float getDistance() {
-  digitalWrite(trigPin, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trigPin, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trigPin, LOW);
-
-  long duration = pulseIn(echoPin, HIGH, 30000);
-  if (duration == 0) {
-    Serial.println("센서 타임아웃");
-    return -1.0;
-  }
-  float distance = duration * 0.034 / 2.0;
-
-  if (distance < 2.0 || distance > 400.0) {
-    Serial.println("잘못된 거리 측정값. 무시합니다.");
-    return -1.0;
-  }
-
-  Serial.print("측정된 거리: ");
-  Serial.println(distance);
-  return distance;
-}
-
-// 모터 상태 업데이트 함수
-void updateMotor() {
-  if (motorState == MOVING_UP) {
-    float distance = getAverageDistance();
-    if (distance == -1.0) {
-      Serial.println("센서 오류. 모터 정지.");
-      stopMotor();
-      return;
-    }
-    if (distance >= maxDistance) {
-      Serial.println("최대 거리 도달. 모터 정지.");
-      stopMotor();
-    } else {
-      moveMotor(0);
-    }
-  } else if (motorState == MOVING_DOWN) {
-    float distance = getAverageDistance();
-    if (distance == -1.0) {
-      Serial.println("센서 오류. 모터 정지.");
-      stopMotor();
-      return;
-    }
-    if (distance <= minDistance) {
-      Serial.println("최소 거리 도달. 모터 정지.");
-      stopMotor();
-    } else {
-      moveMotor(180);
-    }
-  } else if (motorState == STOPPED) {
-    moveMotor(90);
-  }
-}
-
-// 블라인드 올리기 함수
-void moveBlindUp() {
-  if (motorState != MOVING_UP) {
-    Serial.println("블라인드 올리기...");
-    motorState = MOVING_UP;
-  }
-}
-
-// 블라인드 내리기 함수
-void moveBlindDown() {
-  if (motorState != MOVING_DOWN) {
-    Serial.println("블라인드 내리기...");
-    motorState = MOVING_DOWN;
-  }
-}
-
-// 블라인드를 특정 위치로 이동 함수
-void moveBlindToPosition(float targetDistance) {
-  float currentDistance = getAverageDistance();
-  if (currentDistance == -1.0) {
-    Serial.println("센서 오류. 블라인드 이동 불가.");
-    return;
-  }
-
-  if (currentDistance < targetDistance) {
-    moveBlindUp();
-  } else if (currentDistance > targetDistance) {
-    moveBlindDown();
-  } else {
-    stopMotor();
-  }
-}
-
-// 모터 정지 함수
-void stopMotor() {
-  if (motorState != STOPPED) {
-    Serial.println("모터 정지.");
-    motorState = STOPPED;
-  }
-}
-
-// 모터 제어 함수
-void moveMotor(int angle) {
-  continuousServo.write(angle);
-}
-
-// 자동 모드 제어 함수
-void handleAutoMode() {
-  static unsigned long lastCheckTime = 0;
-  unsigned long currentTime = millis();
-
-  if (currentTime - lastCheckTime >= 1000) {
-    lastCheckTime = currentTime;
-
-    float distance = getAverageDistance();
-    int ldrValue = analogRead(ldrPin);
-
-    Serial.print("LDR 값: ");
-    Serial.print(ldrValue);
-    Serial.print(", 평균 거리: ");
-    Serial.println(distance);
-
-    if (ldrValue >= lightThresholdDark && distance < maxDistance) {
-      moveBlindUp();
-    } else if (ldrValue <= lightThresholdBright && distance > minDistance) {
-      moveBlindDown();
-    } else {
-      stopMotor();
-    }
-  }
-}
-
-
